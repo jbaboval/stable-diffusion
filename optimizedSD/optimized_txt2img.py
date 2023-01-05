@@ -14,7 +14,7 @@ from pytorch_lightning import seed_everything
 from torch import autocast
 from contextlib import contextmanager, nullcontext
 from ldm.util import instantiate_from_config
-from optimUtils import split_weighted_subprompts, logger
+from optimUtils import a1111_prompt_decode, split_weighted_subprompts, logger
 from transformers import logging
 from safetensors import safe_open
 # from samplers import CompVisDenoiser
@@ -52,6 +52,12 @@ parser = argparse.ArgumentParser()
 
 parser.add_argument(
     "--prompt", type=str, nargs="?", default="a painting of a virus monster playing guitar", help="the prompt to render"
+)
+parser.add_argument(
+    "--negative", type=str, nargs="?", default="", help="the negative prompt"
+)
+parser.add_argument(
+    "--a1111_prompt", type=str, nargs="?", default=None, help="the prompt to render in A1111 format"
 )
 parser.add_argument("--outdir", type=str, nargs="?", help="dir to write results to", default="outputs/txt2img-samples")
 parser.add_argument(
@@ -201,24 +207,42 @@ if opt.seed == None:
     opt.seed = randint(0, 1000000)
 seed_everything(opt.seed)
 
+batch_size = opt.n_samples
 batch = []
 if opt.from_file:
     print(f"reading prompts from {opt.from_file}")
     with open(opt.from_file, "r") as f:
         data = f.read().splitlines()
         for item in data:
-            batch.append(split_weighted_subprompts(item))
+            batch.append({"subprompts": split_weighted_subprompts(item), "negative_prompts": "", "seed": opt.seed, "normalize": True})
+            opt.seed += batch_size
 elif opt.from_yaml:
     print(f"Parsing prompt batch from {opt.from_yaml}")
     with open(opt.from_yaml, "r") as j:
         job = yaml.safe_load(j)
         for prompt in job["prompts"]:
-            batch.append(prompt)
+            sw = []
+            if 'split_weighted' in prompt:
+                sw = prompt['split_weighted']
+            elif 'a1111' in prompt:
+                sw = a1111_prompt_decode(prompt['a1111'])
+            elif 'txt2img' in prompt:
+                sw = split_weighted_subprompts(prompt['txt2img'])
+
+            if 'a1111_negative' in prompt:
+                swn = a1111_prompt_decode(prompt['a1111_negative'])
+            else:
+                swn = [""]
+            opt.seed = prompt.get('seed', opt.seed)
+            batch.append({"subprompts": sw, "negative_prompts": swn, "seed": opt.seed})
+            opt.seed += batch_size
+elif opt.a1111_prompt:
+    batch.append({"subprompts": a1111_prompt_decode(opt.a1111_prompt), "negative_prompts": a1111_prompt_decode(opt.negative), "seed": opt.seed})
 else:
     assert opt.prompt is not None
     prompt = opt.prompt
     print(f"Using prompt: {prompt}")
-    batch.append(split_weighted_subprompts(prompt))
+    batch.append({"subprompts": split_weighted_subprompts(prompt), "negative_prompts": split_weighted_subprompts(opt.negative), "seed": opt.seed, "normalize": True})
 
 # Logging
 logger(vars(opt), log_csv = "logs/txt2img_logs.csv")
@@ -272,10 +296,7 @@ start_code = None
 if opt.fixed_code:
     start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=opt.device)
 
-
-batch_size = opt.n_samples
 n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
-
 
 if opt.precision == "autocast" and opt.device != "cpu":
     precision_scope = autocast
@@ -288,7 +309,7 @@ with torch.no_grad():
     all_samples = list()
     for n in trange(opt.n_iter, desc="Sampling"):
         for job in tqdm(batch, desc="batch"):
-            human_prompt_name = " ".join([subprompt['prompt'] for subprompt in job])
+            human_prompt_name = " ".join([subprompt['prompt'] for subprompt in job['subprompts']])
             print(f"Sampling for prompt {human_prompt_name}")
             sample_path = os.path.join(outpath, "_".join(re.split(":| ", human_prompt_name)))[:150]
             os.makedirs(sample_path, exist_ok=True)
@@ -296,16 +317,31 @@ with torch.no_grad():
 
             with precision_scope("cuda"):
                 modelCS.to(opt.device)
+
+                totalWeight = sum([subprompt['weight'] for subprompt in job['negative_prompts']])
+                negative_prompt = ''
+                for subprompt in job['negative_prompts']:
+                    # normalize each "sub prompt" and add it
+                    weight = subprompt['weight']
+                    if job.get('normalize', False):
+                        weight /= totalWeight
+                    negative_prompt += f"{subprompt['prompt']}:{totalWeight} "
+
                 uc = None
                 if opt.scale != 1.0:
-                    uc = modelCS.get_learned_conditioning(batch_size * [""])
+                    uc = modelCS.get_learned_conditioning(batch_size * [negative_prompt])
 
-                totalWeight = sum([subprompt['weight'] for subprompt in job])
-                c = torch.zeros_like(uc)
-                for subprompt in job:
+                totalWeight = sum([subprompt['weight'] for subprompt in job['subprompts']])
+                #c = torch.zeros_like(uc)
+                prompt = ''
+                for subprompt in job['subprompts']:
                     # normalize each "sub prompt" and add it
-                        c = torch.add(c, modelCS.get_learned_conditioning(subprompt['prompt']), alpha=(subprompt['weight']/totalWeight))
-
+                    weight = subprompt['weight']
+                    if job.get('normalize', False):
+                        weight /= totalWeight
+                    prompt += f"{subprompt['prompt']}:{totalWeight} "
+                    #c = torch.add(c, modelCS.get_learned_conditioning(subprompt['prompt']), alpha=(subprompt['weight']/totalWeight))
+                c = modelCS.get_learned_conditioning(batch_size * [prompt])
                 shape = [opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f]
 
                 if opt.device != "cpu":
@@ -317,7 +353,7 @@ with torch.no_grad():
                 samples_ddim = model.sample(
                     S=opt.ddim_steps,
                     conditioning=c,
-                    seed=opt.seed,
+                    seed=job['seed'],
                     shape=shape,
                     verbose=False,
                     unconditional_guidance_scale=opt.scale,
@@ -337,10 +373,10 @@ with torch.no_grad():
                     x_sample = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
                     x_sample = 255.0 * rearrange(x_sample[0].cpu().numpy(), "c h w -> h w c")
                     Image.fromarray(x_sample.astype(np.uint8)).save(
-                        os.path.join(sample_path, "seed_" + str(opt.seed) + "_" + f"{base_count:05}.{opt.format}")
+                        os.path.join(sample_path, "seed_" + str(job['seed']) + "_" + f"{base_count:05}.{opt.format}")
                     )
-                    seeds += str(opt.seed) + ","
-                    opt.seed += 1
+                    seeds += str(job['seed']) + ","
+                    job['seed'] += 1
                     base_count += 1
 
                 if opt.device != "cpu":
