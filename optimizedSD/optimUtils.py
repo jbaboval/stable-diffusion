@@ -9,6 +9,7 @@ def split_weighted_subprompts(text):
     if ':' has no value defined, defaults to 1.0
     repeats until no text remaining
     """
+    ret = []
     remaining = len(text)
     prompts = []
     weights = []
@@ -37,15 +38,13 @@ def split_weighted_subprompts(text):
             remaining -= idx
             text = text[idx+1:]
             # append the sub-prompt and its weight
-            prompts.append(prompt)
-            weights.append(weight)
+            ret.append({'prompt': prompt, 'weight': weight})
         else: # no : found
             if len(text) > 0: # there is still text though
                 # take remainder as weight 1
-                prompts.append(text)
-                weights.append(1.0)
+                ret.append({'prompt': text, 'weight': 1.0})
             remaining = 0
-    return prompts, weights
+    return ret
 
 def logger(params, log_csv):
     os.makedirs('logs', exist_ok=True)

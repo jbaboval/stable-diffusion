@@ -1,4 +1,5 @@
 import argparse, os, re
+import yaml
 import torch
 import numpy as np
 from random import randint
@@ -15,6 +16,7 @@ from contextlib import contextmanager, nullcontext
 from ldm.util import instantiate_from_config
 from optimUtils import split_weighted_subprompts, logger
 from transformers import logging
+from safetensors import safe_open
 # from samplers import CompVisDenoiser
 logging.set_verbosity_error()
 
@@ -23,8 +25,19 @@ def chunk(it, size):
     it = iter(it)
     return iter(lambda: tuple(islice(it, size)), ())
 
+def load_model_from_safetensors(st):
+    print(f"Loading model from {st}")
+    sd = {}
+    with safe_open(st, framework="pt", device="cpu") as f:
+        for key in f.keys():
+            sd[key] = f.get_tensor(key)
+
+    return sd
+
 
 def load_model_from_config(ckpt, verbose=False):
+    if "safetensors" in ckpt:
+        return load_model_from_safetensors(ckpt)
     print(f"Loading model from {ckpt}")
     pl_sd = torch.load(ckpt, map_location="cpu")
     if "global_step" in pl_sd:
@@ -32,8 +45,7 @@ def load_model_from_config(ckpt, verbose=False):
     sd = pl_sd["state_dict"]
     return sd
 
-
-config = "optimizedSD/v1-inference.yaml"
+config = "optimizedSD/v1p-inference.yaml"
 DEFAULT_CKPT = "models/ldm/stable-diffusion-v1/model.ckpt"
 
 parser = argparse.ArgumentParser()
@@ -130,6 +142,11 @@ parser.add_argument(
     help="if specified, load prompts from this file",
 )
 parser.add_argument(
+    "--from-yaml",
+    type=str,
+    help="if specified, load prompts from this JSON file",
+)
+parser.add_argument(
     "--seed",
     type=int,
     default=None,
@@ -147,7 +164,7 @@ parser.add_argument(
     help="Reduces inference time on the expense of 1GB VRAM",
 )
 parser.add_argument(
-    "--precision", 
+    "--precision",
     type=str,
     help="evaluate at this precision",
     choices=["full", "autocast"],
@@ -184,6 +201,25 @@ if opt.seed == None:
     opt.seed = randint(0, 1000000)
 seed_everything(opt.seed)
 
+batch = []
+if opt.from_file:
+    print(f"reading prompts from {opt.from_file}")
+    with open(opt.from_file, "r") as f:
+        data = f.read().splitlines()
+        for item in data:
+            batch.append(split_weighted_subprompts(item))
+elif opt.from_yaml:
+    print(f"Parsing prompt batch from {opt.from_yaml}")
+    with open(opt.from_yaml, "r") as j:
+        job = yaml.safe_load(j)
+        for prompt in job["prompts"]:
+            batch.append(prompt)
+else:
+    assert opt.prompt is not None
+    prompt = opt.prompt
+    print(f"Using prompt: {prompt}")
+    batch.append(split_weighted_subprompts(prompt))
+
 # Logging
 logger(vars(opt), log_csv = "logs/txt2img_logs.csv")
 
@@ -207,6 +243,7 @@ for key in lo:
 
 config = OmegaConf.load(f"{config}")
 
+print("Instantiate model")
 model = instantiate_from_config(config.modelUNet)
 _, _ = model.load_state_dict(sd, strict=False)
 model.eval()
@@ -214,15 +251,18 @@ model.unet_bs = opt.unet_bs
 model.cdevice = opt.device
 model.turbo = opt.turbo
 
+print("Instantiate CondStage model")
 modelCS = instantiate_from_config(config.modelCondStage)
 _, _ = modelCS.load_state_dict(sd, strict=False)
 modelCS.eval()
 modelCS.cond_stage_model.device = opt.device
 
+print("Instantiate FirstStage model")
 modelFS = instantiate_from_config(config.modelFirstStage)
 _, _ = modelFS.load_state_dict(sd, strict=False)
 modelFS.eval()
 del sd
+print("...done")
 
 if opt.device != "cpu" and opt.precision == "autocast":
     model.half()
@@ -235,20 +275,6 @@ if opt.fixed_code:
 
 batch_size = opt.n_samples
 n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
-if not opt.from_file:
-    assert opt.prompt is not None
-    prompt = opt.prompt
-    print(f"Using prompt: {prompt}")
-    data = [batch_size * [prompt]]
-
-else:
-    print(f"reading prompts from {opt.from_file}")
-    with open(opt.from_file, "r") as f:
-        text = f.read()
-        print(f"Using prompt: {text.strip()}")
-        data = text.splitlines()
-        data = batch_size * list(data)
-        data = list(chunk(sorted(data), batch_size))
 
 
 if opt.precision == "autocast" and opt.device != "cpu":
@@ -261,9 +287,10 @@ with torch.no_grad():
 
     all_samples = list()
     for n in trange(opt.n_iter, desc="Sampling"):
-        for prompts in tqdm(data, desc="data"):
-
-            sample_path = os.path.join(outpath, "_".join(re.split(":| ", prompts[0])))[:150]
+        for job in tqdm(batch, desc="batch"):
+            human_prompt_name = " ".join([subprompt['prompt'] for subprompt in job])
+            print(f"Sampling for prompt {human_prompt_name}")
+            sample_path = os.path.join(outpath, "_".join(re.split(":| ", human_prompt_name)))[:150]
             os.makedirs(sample_path, exist_ok=True)
             base_count = len(os.listdir(sample_path))
 
@@ -272,21 +299,12 @@ with torch.no_grad():
                 uc = None
                 if opt.scale != 1.0:
                     uc = modelCS.get_learned_conditioning(batch_size * [""])
-                if isinstance(prompts, tuple):
-                    prompts = list(prompts)
 
-                subprompts, weights = split_weighted_subprompts(prompts[0])
-                if len(subprompts) > 1:
-                    c = torch.zeros_like(uc)
-                    totalWeight = sum(weights)
+                totalWeight = sum([subprompt['weight'] for subprompt in job])
+                c = torch.zeros_like(uc)
+                for subprompt in job:
                     # normalize each "sub prompt" and add it
-                    for i in range(len(subprompts)):
-                        weight = weights[i]
-                        # if not skip_normalize:
-                        weight = weight / totalWeight
-                        c = torch.add(c, modelCS.get_learned_conditioning(subprompts[i]), alpha=weight)
-                else:
-                    c = modelCS.get_learned_conditioning(prompts)
+                        c = torch.add(c, modelCS.get_learned_conditioning(subprompt['prompt']), alpha=(subprompt['weight']/totalWeight))
 
                 shape = [opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f]
 
