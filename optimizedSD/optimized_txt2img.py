@@ -18,6 +18,7 @@ from ldm.util import instantiate_from_config
 from optimUtils import a1111_prompt_decode, split_weighted_subprompts, logger
 from transformers import logging
 from safetensors import safe_open
+from codeformer_model import FaceRestorerCodeFormer
 # from samplers import CompVisDenoiser
 logging.set_verbosity_error()
 
@@ -233,7 +234,7 @@ elif opt.from_yaml:
             if 'a1111_negative' in prompt:
                 swn = a1111_prompt_decode(prompt['a1111_negative'] + job.get('global_negative'))
             else:
-                swn = [""]
+                swn = a1111_prompt_decode("" + job.get('global_negative'))
             opt.seed = prompt.get('seed', opt.seed)
             batch.append({"name": prompt.get('name', None), "subprompts": sw, "negative_prompts": swn, "seed": opt.seed})
             opt.seed += batch_size
@@ -292,6 +293,8 @@ print("...done")
 if opt.device != "cpu" and opt.precision == "autocast":
     model.half()
     modelCS.half()
+
+face_restorer = FaceRestorerCodeFormer()
 
 start_code = None
 if opt.fixed_code:
@@ -378,7 +381,13 @@ with torch.no_grad():
                     x_samples_ddim = modelFS.decode_first_stage(samples_ddim[i].unsqueeze(0))
                     x_sample = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
                     x_sample = 255.0 * rearrange(x_sample[0].cpu().numpy(), "c h w -> h w c")
-                    Image.fromarray(x_sample.astype(np.uint8)).save(
+                    x_sample = x_sample.astype(np.uint8)
+                    if job.get('restore_faces', True):
+                        x_sample_restored = face_restorer.restore(x_sample)
+                        Image.fromarray(x_sample_restored).save(
+                           os.path.join(sample_path, "seed_" + str(job['seed']) + "_" + f"{base_count:05}-restored.{opt.format}")
+                        )
+                    Image.fromarray(x_sample).save(
                         os.path.join(sample_path, "seed_" + str(job['seed']) + "_" + f"{base_count:05}.{opt.format}")
                     )
                     seeds += str(job['seed']) + ","
