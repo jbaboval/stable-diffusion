@@ -5,6 +5,7 @@ import numpy as np
 from random import randint
 from omegaconf import OmegaConf
 from PIL import Image
+from PIL.PngImagePlugin import PngInfo
 from tqdm import tqdm, trange
 from itertools import islice
 from einops import rearrange
@@ -230,11 +231,11 @@ elif opt.from_yaml:
                 sw = split_weighted_subprompts(prompt['txt2img'])
 
             if 'a1111_negative' in prompt:
-                swn = a1111_prompt_decode(prompt['a1111_negative'])
+                swn = a1111_prompt_decode(prompt['a1111_negative'] + job.get('global_negative'))
             else:
                 swn = [""]
             opt.seed = prompt.get('seed', opt.seed)
-            batch.append({"subprompts": sw, "negative_prompts": swn, "seed": opt.seed})
+            batch.append({"name": prompt.get('name', None), "subprompts": sw, "negative_prompts": swn, "seed": opt.seed})
             opt.seed += batch_size
 elif opt.a1111_prompt:
     batch.append({"subprompts": a1111_prompt_decode(opt.a1111_prompt), "negative_prompts": a1111_prompt_decode(opt.negative), "seed": opt.seed})
@@ -308,9 +309,12 @@ with torch.no_grad():
 
     all_samples = list()
     for n in trange(opt.n_iter, desc="Sampling"):
-        for job in tqdm(batch, desc="batch"):
-            human_prompt_name = " ".join([subprompt['prompt'] for subprompt in job['subprompts']])
-            print(f"Sampling for prompt {human_prompt_name}")
+        jobBar = tqdm(batch, desc="batch")
+        for job in jobBar:
+            human_prompt_name = job.get('name')
+            if human_prompt_name is None:
+                human_prompt_name = " ".join([subprompt['prompt'] for subprompt in job['subprompts']])
+            jobBar.set_description(human_prompt_name)
             sample_path = os.path.join(outpath, "_".join(re.split(":| ", human_prompt_name)))[:150]
             os.makedirs(sample_path, exist_ok=True)
             base_count = len(os.listdir(sample_path))
@@ -369,6 +373,8 @@ with torch.no_grad():
                 print("saving images")
                 for i in range(batch_size):
 
+                    #info = PngInfo()
+                    #info.add_text("Parameters", )
                     x_samples_ddim = modelFS.decode_first_stage(samples_ddim[i].unsqueeze(0))
                     x_sample = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
                     x_sample = 255.0 * rearrange(x_sample[0].cpu().numpy(), "c h w -> h w c")
